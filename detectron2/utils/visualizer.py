@@ -187,6 +187,19 @@ class _PanopticPrediction:
                 yield mask, sinfo
 
 
+def _append_property_tags(labels, props, class_names):
+    # logger.info("class_names {}".format(class_names))
+    for i in range(len(labels)):
+        p = props[i]
+        p_str = '\n'
+        for pi in p:
+            p_str += class_names[pi] + '\n'
+        # for ci in range(len(class_names)):
+        #     if p[ci] == 1:
+        labels[i] += p_str
+    
+    return labels
+
 def _create_text_labels(classes, scores, class_names):
     """
     Args:
@@ -337,6 +350,8 @@ class Visualizer:
         classes = predictions.pred_classes if predictions.has("pred_classes") else None
         labels = _create_text_labels(classes, scores, self.metadata.get("thing_classes", None))
         keypoints = predictions.pred_keypoints if predictions.has("pred_keypoints") else None
+        properties = predictions.pred_props if predictions.has("pred_props") else None
+        labels = _append_property_tags(labels, properties, self.metadata.get("property_classes", None))
 
         if predictions.has("pred_masks"):
             masks = np.asarray(predictions.pred_masks)

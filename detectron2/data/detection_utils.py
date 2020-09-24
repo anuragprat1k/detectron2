@@ -247,6 +247,8 @@ def annotations_to_instances(annos, image_size, mask_format="polygon"):
             "gt_masks", "gt_keypoints", if they can be obtained from `annos`.
             This is the format that builtin models expect.
     """
+    logger = logging.getLogger(__name__)
+
     boxes = [BoxMode.convert(obj["bbox"], obj["bbox_mode"], BoxMode.XYXY_ABS) for obj in annos]
     target = Instances(image_size)
     boxes = target.gt_boxes = Boxes(boxes)
@@ -255,6 +257,14 @@ def annotations_to_instances(annos, image_size, mask_format="polygon"):
     classes = [obj["category_id"] for obj in annos]
     classes = torch.tensor(classes, dtype=torch.int64)
     target.gt_classes = classes
+
+    props = [obj["properties"] for obj in annos]
+    # logger.info("circa padding props {}".format(props))
+    props = torch.nn.utils.rnn.pad_sequence(props, batch_first=True, padding_value=0)
+    # props = torch.nn.utils.rnn.pack_padded_sequence(props, lengths=5, batch_first=True)
+    # props = torch.tensor(props, dtype=torch.int64)
+    # logger.info("post padding shape {}".format(props.shape))
+    target.gt_props = props
 
     if len(annos) and "segmentation" in annos[0]:
         segms = [obj["segmentation"] for obj in annos]

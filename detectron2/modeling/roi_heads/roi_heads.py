@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from detectron2.layers import ShapeSpec
+from detectron2.layers import ShapeSpec, cat
 from detectron2.structures import Boxes, ImageList, Instances, pairwise_iou
 from detectron2.utils.events import get_event_storage
 from detectron2.utils.registry import Registry
@@ -20,6 +20,7 @@ from .box_head import build_box_head
 from .fast_rcnn import FastRCNNOutputLayers, FastRCNNOutputs
 from .keypoint_head import build_keypoint_head
 from .mask_head import build_mask_head
+from .properties_head import build_properties_head
 
 ROI_HEADS_REGISTRY = Registry("ROI_HEADS")
 ROI_HEADS_REGISTRY.__doc__ = """
@@ -354,6 +355,9 @@ class Res5ROIHeads(ROIHeads):
         self.box_predictor = FastRCNNOutputLayers(
             out_channels, self.num_classes, self.cls_agnostic_bbox_reg
         )
+        self.properties_predictor = FastRCNNOutputLayers(
+            out_channels, self.num_classes, self.cls_agnostic_bbox_reg
+        )
 
         if self.mask_on:
             self.mask_head = build_mask_head(
@@ -408,6 +412,7 @@ class Res5ROIHeads(ROIHeads):
         )
         feature_pooled = box_features.mean(dim=[2, 3])  # pooled to 1x1
         pred_class_logits, pred_proposal_deltas = self.box_predictor(feature_pooled)
+        prop_class_logits, _ = self.properties_predictor(feature_pooled)
         del feature_pooled
 
         outputs = FastRCNNOutputs(
@@ -418,9 +423,21 @@ class Res5ROIHeads(ROIHeads):
             self.smooth_l1_beta,
         )
 
+        p_outputs = FastRCNNOutputs(
+            self.box2box_transform,
+            prop_class_logits,
+            pred_proposal_deltas,
+            proposals,
+            self.smooth_l1_beta,
+        )
+
         if self.training:
             del features
             losses = outputs.losses()
+            # losses = {"loss_mask": mask_rcnn_loss(mask_coarse_logits, proposals)}
+            losses.update({"prop_loss": 1.0})
+            print("\nCanary in the coal mine\n")
+            # losses.update(p_outputs.losses)
             if self.mask_on:
                 proposals, fg_selection_masks = select_foreground_proposals(
                     proposals, self.num_classes
@@ -435,6 +452,9 @@ class Res5ROIHeads(ROIHeads):
             return [], losses
         else:
             pred_instances, _ = outputs.inference(
+                self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
+            )
+            pred_properties, _ = p_outputs.inference(
                 self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
             )
             pred_instances = self.forward_with_given_boxes(features, pred_instances)
@@ -483,7 +503,37 @@ class StandardROIHeads(ROIHeads):
         self._init_box_head(cfg, input_shape)
         self._init_mask_head(cfg, input_shape)
         self._init_keypoint_head(cfg, input_shape)
+        self._init_prop_head(cfg, input_shape)
 
+    def _init_prop_head(self, cfg, input_shape):
+        # fmt: off
+        pooler_resolution        = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
+        pooler_scales            = tuple(1.0 / input_shape[k].stride for k in self.in_features)
+        sampling_ratio           = cfg.MODEL.ROI_BOX_HEAD.POOLER_SAMPLING_RATIO
+        pooler_type              = cfg.MODEL.ROI_BOX_HEAD.POOLER_TYPE
+        self.train_on_pred_boxes = cfg.MODEL.ROI_BOX_HEAD.TRAIN_ON_PRED_BOXES
+        # fmt: on
+
+        # If StandardROIHeads is applied on multiple feature maps (as in FPN),
+        # then we share the same predictors and therefore the channel counts must be the same
+        in_channels = [input_shape[f].channels for f in self.in_features]
+        # Check all channel counts are equal
+        assert len(set(in_channels)) == 1, in_channels
+        in_channels = in_channels[0]
+
+        self.prop_pooler = ROIPooler(
+            output_size=pooler_resolution,
+            scales=pooler_scales,
+            sampling_ratio=sampling_ratio,
+            pooler_type=pooler_type,
+        )
+        # Here we split "box head" and "box predictor", which is mainly due to historical reasons.
+        # They are used together so the "box predictor" layers should be part of the "box head".
+        # New subclasses of ROIHeads do not need "box predictor"s.
+        self.prop_head = build_properties_head(
+            cfg, ShapeSpec(channels=in_channels, height=pooler_resolution, width=pooler_resolution)
+        )
+    
     def _init_box_head(self, cfg, input_shape):
         # fmt: off
         pooler_resolution        = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
@@ -585,6 +635,7 @@ class StandardROIHeads(ROIHeads):
             # predicted by the box head.
             losses.update(self._forward_mask(features, proposals))
             losses.update(self._forward_keypoint(features, proposals))
+            losses.update(self._forward_prop(features, proposals))
             return proposals, losses
         else:
             pred_instances = self._forward_box(features, proposals)
@@ -618,7 +669,84 @@ class StandardROIHeads(ROIHeads):
 
         instances = self._forward_mask(features, instances)
         instances = self._forward_keypoint(features, instances)
+        _ = self._forward_prop(features, instances)
+        # logger.info("pred_instances {}".format(instances))
         return instances
+
+    def _forward_prop(
+        self, features: Dict[str, torch.Tensor], instances: List[Instances]
+    ) -> Union[Dict[str, torch.Tensor], List[Instances]]:
+        """
+        Forward logic of the box prediction branch. If `self.train_on_pred_boxes is True`,
+            the function puts predicted boxes in the `proposal_boxes` field of `proposals` argument.
+
+        Args:
+            features (dict[str, Tensor]): mapping from feature map names to tensor.
+                Same as in :meth:`ROIHeads.forward`.
+            proposals (list[Instances]): the per-image object proposals with
+                their matching ground truth.
+                Each has fields "proposal_boxes", and "objectness_logits",
+                "gt_classes", "gt_boxes".
+
+        Returns:
+            In training, a dict of losses.
+            In inference, a list of `Instances`, the predicted instances.
+        """
+
+        features = [features[f] for f in self.in_features]
+        
+        if self.training:
+            # The loss is only defined on positive proposals.
+            proposals, _ = select_foreground_proposals(instances, self.num_classes)
+            proposal_boxes = [x.proposal_boxes for x in proposals]
+            prop_features = self.prop_pooler(features, proposal_boxes)
+            # logger.info("forward_prop feat {}, foreground proposals {}".format(prop_features.shape, proposals))
+            return self.prop_head(prop_features, proposals)
+        else:
+            pred_boxes = [x.pred_boxes for x in instances]
+            prop_features = self.prop_pooler(features, pred_boxes)
+            return self.prop_head(prop_features, instances)
+
+        # box_features = self.prop_pooler(features, [x.proposal_boxes for x in proposals])
+        # box_features = self.prop_head(box_features)
+        # pred_class_logits, pred_proposal_deltas = self.prop_predictor(box_features)
+        # del box_features
+
+        # # if proposals[0].has("gt_props"):
+        # #     self.gt_props = cat([p.gt_props for p in proposals], dim=0)
+        # #     logger.info("prop logits shape {}, self.gt_props {}".format(pred_class_logits.shape, self.gt_props.shape))
+        # #     # logger.info("proposals {}".format(proposals[0].gt_props))
+        # # logger.info("pred_class_logits {}".format(pred_class_logits.shape))
+
+        # outputs = FastRCNNOutputs(
+        #     self.box2box_transform,
+        #     pred_class_logits,
+        #     pred_proposal_deltas,
+        #     proposals,
+        #     self.smooth_l1_beta,
+        # )
+
+        # if self.training:
+        #    return self._get_prop_loss(proposals, pred_class_logits)
+        # else:
+        #     pred_boxes = [x.pred_boxes for x in instances]
+        #     keypoint_features = self.keypoint_pooler(features, pred_boxes)
+        #     return self.keypoint_head(keypoint_features, instances)
+
+        #     return pred_instances
+
+    def _get_prop_loss(self, proposals, logits):
+        # if len(proposals):
+            # The following fields should exist only when training.
+        logging.info("hey there {}".format(proposals[0]))
+        assert proposals[0].has("gt_props")
+        if proposals[0].has("gt_props"):
+            # self.gt_props = box_type.cat([p.gt_props for p in proposals])
+            self.gt_props = cat([p.gt_props for p in proposals], dim=0)
+            logging.info("self.gt_props {}".format(self.gt_props))
+        
+        return {"loss_prop": 1.5}
+
 
     def _forward_box(
         self, features: Dict[str, torch.Tensor], proposals: List[Instances]
@@ -645,6 +773,9 @@ class StandardROIHeads(ROIHeads):
         pred_class_logits, pred_proposal_deltas = self.box_predictor(box_features)
         del box_features
 
+        # gt_classes = cat([p.gt_classes for p in proposals], dim=0)
+        # logger.info("bbox logits {}, gt {}".format(pred_class_logits.shape, gt_classes.shape))
+        
         outputs = FastRCNNOutputs(
             self.box2box_transform,
             pred_class_logits,
